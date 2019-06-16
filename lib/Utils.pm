@@ -8,11 +8,10 @@ use Exporter 'import';
 use DBI;
 use DBD::Pg qw(:pg_types);
 use LWP;
-use JSON;
 
 use LWP::UserAgent;
 use MIME::Base64;
-#use JSON::MaybeXS;
+use JSON::MaybeXS;
 use Data::Dumper;
 use Data::Printer;
 use MIME::Base64;
@@ -36,6 +35,7 @@ our @EXPORT = qw( write_dumper_to_file
                     _db_disconnect _log_init
                     _get_response_token
                     cbc_decrypt_key
+                    cbc_decrypt_array
                     self_cbc_decrypt_key
                     dlr_cbc_decrypt_md
                     dlr_decrypt_data_cbc
@@ -47,6 +47,8 @@ our @EXPORT = qw( write_dumper_to_file
                     get_krids
                     get_keyrings
                     %GLOBAL_ALLOWED_DATA_TYPES
+                    prep_copy copy_data finish_copy
+                    newjson
 );
 
 
@@ -104,8 +106,7 @@ sub _get_response_token {
 
     my $ua = LWP::UserAgent->new();
     my $log = Log::Log4perl->get_logger();
-    #my $json = JSON::MaybeXS::JSON->new->pretty(1)->canonical(1)->utf8(1)->allow_blessed(1)->convert_blessed(1);
-    my $json = JSON->new;
+    my $json = newjson();
 
     my $resp = $ua->post(
             'http://dealer.md.api.exetel.com.au:8093/auth_user',
@@ -146,7 +147,7 @@ sub _oauth_request {
 
         my $cnt = 10;
         my $ua = LWP::UserAgent->new();
-        my $json = JSON->new;
+        my $json = newjson();
 
         for ( my $i = 0; $i < $cnt; $i++ ) {
                 my $resp = $ua->post(
@@ -417,7 +418,7 @@ sub dlr_decrypt_data_cbc {
 
 sub dlr_cbc_decrypt_md {
         my ( $oauth_data, $resp_content, $data ) = @_;
-        my $json = JSON->new;
+        my $json = newjson();
         my $user_jwt = $resp_content->{jwt};
 
         my $packed_data = {
@@ -524,6 +525,29 @@ sub self_cbc_decrypt_key {
         return $decrypted_data;
 }
 
+sub cbc_decrypt_array {
+	my ($data, $retref) = @_;
+	CORE::state $cbc_dec //= Crypt::Mode::CBC->new('AES');
+
+	my $decrypted_data = [
+		map {
+			my ($iv, $val) = ($_->{data_enc} =~ m/^(.{16})(.+)$/s);    # strip off first 16 bytes to use as `iv`
+			my $data_dec = $cbc_dec->decrypt(
+				$val,
+				pack("H*", $_->{key}),
+				$iv
+			);
+			{
+				data_enc => $_->{data_enc},
+				data_dec => $data_dec,
+				extra => $_->{extra}//{},
+			}
+		} @$data
+	];
+
+	return $decrypted_data;
+}
+
 sub cbc_decrypt_key {
         my ($data) = @_;
 
@@ -599,10 +623,9 @@ sub _log_init {
 }
 
 sub get_krids {
+    my ($dbh, $lower_tstz_range, $upper_tstz_range, $oauth_data, $resp_content) = @_;
 
-    my ( $dbh, $lower_tstz_range, $upper_tstz_range, $oauth_data, $resp_content ) = @_;
-
-    my $json = JSON->new;   ### TODO:::  Enclose dsotm fetch in a sub and get rid of this....
+    my $json = newjson();   ### TODO:::  Enclose dsotm fetch in a sub and get rid of this....
     my $log = Log::Log4perl->get_logger();
 
     $log->info("lower_tstz_range ==>> ". $lower_tstz_range);
@@ -711,8 +734,11 @@ sub get_keyrings {
                   ? rsa_decrypt(
                                 $oauth_data,
                                 $resp_content,
-                                { map {    #print "\n DECRYPT mk_uuid for keyring table ==>> " . $krids->{$_->[0]}->{mk_uuid} ."\n";
-                                    $_->[0] => { mk_uuid => $krids->{$_->[0]}->{mk_uuid}, data => $_->[1] } } @$rtkeyrings }
+                                { 
+                                        map {    #print "\n DECRYPT mk_uuid for keyring table ==>> " . $krids->{$_->[0]}->{mk_uuid} ."\n";
+                                                $_->[0] => { mk_uuid => $krids->{$_->[0]}->{mk_uuid}, data => $_->[1] } 
+                                        } @$rtkeyrings
+                                }
                             )
                   : {}; ## ( $krid, $key, $metadata, $tsr ) -> { $krid => $metadata }
 
