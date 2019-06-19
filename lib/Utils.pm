@@ -622,6 +622,7 @@ sub _log_init {
 
 }
 
+
 sub get_krids {
     my ($dbh, $lower_tstz_range, $upper_tstz_range, $oauth_data, $resp_content) = @_;
 
@@ -639,59 +640,60 @@ sub get_krids {
     my $stmt = "SELECT
                     moon,
                     tsr,
-                    yutu
+                    yutu,
+                    lower(tsr) AS tsr_start,
+                    upper(tsr) AS tsr_end
                 FROM
                     dsotm
                 WHERE
-                    tsr && tstzrange( ?, ?, '[]')";
+                    tsr && tstzrange( ?, ?, '[]') order by tsr desc";
 
     my $sth = $dbh->prepare( $stmt );
     my $rv = $sth->execute( $lower_tstz_range, $upper_tstz_range ) or die $DBI::errstr;
 
     #print $DBI::errstr if($rv < 0);
 
-    my $slices = $sth->fetchall_arrayref;
+    my $slices = $sth->fetchall_arrayref({});
 
     my $mds = @$slices
             ? rsa_decrypt( $oauth_data,
-                           $resp_content,
-                           { map { unpack( "H*", $_->[0] ) => { mk_uuid => $_->[2], data => $_->[0] } } @$slices } )
+                           $resp_content,                           
+                           { map { unpack( "H*", $_->{moon} ) => { mk_uuid => $_->{yutu}, data => $_->{moon} } } @$slices } )
             : {};
 
     printf ( "mds: %s", Dumper($mds) );
 
-    my %darksides;
+    my %krids;
     foreach my $slice (@$slices) {
-            my ( $moon, $tsr, $mk_uuid ) = @$slice;
 
-            printf ( "moon before json_decode : %s", Dumper($moon) );
-            my $moon_data = $json->decode( $mds->{unpack( "H*", $moon)});
+            printf ( "moon before json_decode : %s", Dumper( $slice->{moon} ) );
+            my $moon_data = $json->decode( $mds->{unpack( "H*", $slice->{moon} )});
             printf ( "moon_data after json_decode : %s", Dumper($moon_data) );
 
-            my $tsr_range = $json->decode($tsr);
-            my $tsr_start = DateTime::Format::Pg->parse_datetime( $tsr_range->[0] );
-            my $tsr_end   = DateTime::Format::Pg->parse_datetime( $tsr_range->[1] );
-            $darksides{ $moon_data->{krid} } = {
+            #my $tsr_range = $json->decode($tsr);
+            my $tsr_start = DateTime::Format::Pg->parse_datetime( $slice->{tsr_start} );
+            my $tsr_end   = DateTime::Format::Pg->parse_datetime( $slice->{tsr_end} );
+            $krids{ $moon_data->{krid} } = {
                     krid      => $moon_data->{krid},
                     timerange => DateTime::Span->from_datetimes( start => $tsr_start, end => $tsr_end ),
-                    mk_uuid   => $mk_uuid,
+                    mk_uuid   => $slice->{yutu},
             };
-            printf ( "darksides mk_uuid: %s", Dumper( $darksides{ $moon_data->{krid} }->{'mk_uuid'} ) );
-            printf ( "darksides krid: %s", Dumper( $darksides{ $moon_data->{krid} }->{'krid'} ) );
+            printf ( "krids mk_uuid: %s", Dumper( $krids{ $moon_data->{krid} }->{'mk_uuid'} ) );
+            printf ( "krids krid: %s", Dumper( $krids{ $moon_data->{krid} }->{'krid'} ) );
 
             printf ( "moon_data: %s", Dumper($moon_data) );
     } ## end foreach my $slice (@$slices)
 
     $sth->finish;
 
-    #my $krids = $darksides;
+    #my $krids = $krids;
 
-    return \%darksides;
+    return \%krids;
 }
 
 sub get_keyrings {
 
-    my ( $dbh, $krids, $oauth_data, $resp_content ) = @_;
+    my ( $dbh, $krids, $oauth_data, $resp_content, $input_timerange_span ) = @_;
 
         my $keyring_keys = [];
         my $ts_range_type = "selves";
@@ -707,8 +709,11 @@ sub get_keyrings {
 
 
         my $max = 65535; ## max number of parameters for DBD::pg
+        my $log = Log::Log4perl->get_logger();
 
-
+        my $strp = DateTime::Format::Strptime->new(
+            pattern   => '%FT%T%z',
+        );
         #printf ( "darksides or krids: %s", Dumper($darksides) );
 
         #foreach my $krids_list ( spart( $max, uniqstr keys %$krids ) ) {
@@ -779,18 +784,32 @@ sub get_keyrings {
                                 $sess_secrets->{mk_uuid} = $krids->{$krid}->{mk_uuid};
 
                                 my $hkid = pbkdf2(
-                                        $sess_secrets->{kid},
-                                        pack( 'H*', $sess_secrets->{salt}->{search_kid} ),
-                                         $sess_secrets->{pdkargs}->{iters},
-                                         $sess_secrets->{pdkargs}->{hash},
-                                         $sess_secrets->{pdkargs}->{dklen}
+                                    $sess_secrets->{kid},
+                                    pack( 'H*', $sess_secrets->{salt}->{search_kid} ),
+                                        $sess_secrets->{pdkargs}->{iters},
+                                        $sess_secrets->{pdkargs}->{hash},
+                                        $sess_secrets->{pdkargs}->{dklen}
                                 );
                                 $sess_secrets->{hkid} = $hkid;
                                 $keyring_hkid_mapping->{$hkid} = $sess_secrets->{kid};
                                 foreach my $dtype_info (@{$skeyring->{info}}) {
 
-                                        ######################print "dtype_info INFO " . Dumper($dtype_info);
-                                        ######################print "dtype_info kid " . Dumper( $dtype_info->{kid} );
+                                ######################print "dtype_info INFO " . Dumper($dtype_info);
+                                ######################print "dtype_info kid " . Dumper( $dtype_info->{kid} );
+
+                                        my $start_dt = $strp->parse_datetime( $dtype_info->{logts_range}->{start} );
+                                        my $end_dt   = $strp->parse_datetime( $dtype_info->{logts_range}->{end} );
+
+                                        unless ( $input_timerange_span->contains( $end_dt ) &&
+                                                $input_timerange_span->contains( $start_dt ) && 
+                                                $GLOBAL_ALLOWED_DATA_TYPES{$dtype_info->{data_type}} ) {
+
+                                            $log->info( "keyring: $krid keep data: " . Dumper($dtype_info) );
+                                            next;
+                                        }
+
+                                        print "keyring: $krid nuke data: " . Dumper( $dtype_info );
+                                        $log->info( "keyring: $krid nuke data: " . Dumper( $dtype_info ) );
 
                                         my $dtype_hkid = pbkdf2(
                                                 $dtype_info->{kid},
@@ -844,13 +863,13 @@ sub get_keyrings {
                 } ## end foreach my $keyring (@$rtkeyrings)
                 $sth->finish;
         };
-    $keyrings{$ts_range_type} = $keyring_keys;
-#print "keyring_hkid_mapping DUMPER " . Dumper($keyring_hkid_mapping);
-#}
+        $keyrings{$ts_range_type} = $keyring_keys;
+        #print "keyring_hkid_mapping DUMPER " . Dumper($keyring_hkid_mapping);
+        #}
 
-#print "keyrings data-structure with ts_range_type: " . Dumper(\%keyrings);
-my $keyringsref = \%keyrings;
-write_dumper_to_file( "keyrings.txt", $keyringsref);
+        #print "keyrings data-structure with ts_range_type: " . Dumper(\%keyrings);
+        my $keyringsref = \%keyrings;
+        write_dumper_to_file( "keyrings.txt", $keyringsref);
 
     return ( \%keyrings, \%hkid_hex_hash, \%keyring_krid_mapping, \%keyring_metadata );
 

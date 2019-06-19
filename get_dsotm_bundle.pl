@@ -10,8 +10,8 @@ use JSON;
 
 use LWP::UserAgent;
 use MIME::Base64;
-#use JSON::MaybeXS;
-use JSON;
+use JSON::MaybeXS;
+#use JSON;
 use Data::Dumper;
 use Data::Printer;
 use MIME::Base64;
@@ -83,7 +83,9 @@ my $krids = get_krids ( $dbh, $lower_tstz_range, $upper_tstz_range, $oauth_data,
 #my $keyrings = get_keyrings ( $dbh, $krids, $oauth_data, $resp_content );
 my ( $keyrings, $hkid_hex_hash,
      $keyring_krid_mapping,
-     $keyring_metadata ) = get_keyrings ( $dbh, $krids, $oauth_data, $resp_content ); #get krid from keyring
+     $keyring_metadata ) = get_keyrings ( $dbh, $krids, $oauth_data, $resp_content, $input_timerange_span ); #get krid from keyring
+
+#my $salty_kids = get_keyrings($dbh, $krids, $oauth_data, $resp_content, $tsr_start_dt, $tsr_end_dt);
 
 my $bundle_payloads_secrets = get_bundle_payload ( $dbh, $keyrings,$hkid_hex_hash,$keyring_krid_mapping,
                                                          $keyring_metadata, $oauth_data, $resp_content );
@@ -406,7 +408,9 @@ sub search_stash_brick {
 
         my $data = %$lkrfs{$key};
         #print "data PRINT " . Dumper($data);
-        my $link_data = JSON->new->utf8->decode($data);
+        #my $link_data = JSON->new->utf8->decode($data);
+        my $link_data = newjson()->decode($data);
+
         $log->info( "link data PRINT " . Dumper($link_data) );
 
         $log->info( "link data ts start " .  $link_data->{ts}->{start} );
@@ -429,7 +433,9 @@ sub search_stash_brick {
 
 
         if ( $input_timerange_span->contains( $end_dt ) &&
+             #$input_timerange_span->contains( $start_dt ) &&
              exists ( $GLOBAL_ALLOWED_DATA_TYPES{ $link_data->{dt} } ) ) {
+
             $log->info("TIMERANGE CONSTRAINT satisfied DATATYPE CONSTRAINT satisfied " . $link_data->{dt} . " ==>> GOOD TO GO");
             $log->info("DATATYPE " . $link_data->{dt} . " EXISTS. link table contains " . Dumper $GLOBAL_ALLOWED_DATA_TYPES{ $link_data->{dt} } );
 

@@ -151,7 +151,7 @@ sub _get_response_token {
     );
 
     print "\n\noauth_data ==>> ". mlnp($oauth_data);
-    $log->info("oauth_data ==>> ". mlnp($oauth_data));
+    #$log->info("oauth_data ==>> ". mlnp($oauth_data));
 
     return ( $oauth_data, $resp_content  );
 }
@@ -601,13 +601,18 @@ sub _db_connect {
 
     my $log = Log::Log4perl->get_logger();
     #my $dbh = DBI->connect($dsn, $userid, $password,  {AutoCommit => 1, PrintError => 1, RaiseError => 1})
-    my $dbh = DBI->connect($dsn, $userid, $password,  { RaiseError => 1 } )
-    or die $DBI::errstr;
+	# AP: 20190618: if you turn off RaiseError be sure to sprinkle the code with your own
+	# error handling.
+    my $dbh = DBI->connect($dsn, $userid, $password, { RaiseError => 1 }) or die $DBI::errstr;
+
+	if ($host =~ /flush/) {
+		$dbh->do(q{SET work_mem = '20GB';});
+	};
 
     print "Opened database successfully\n";
 
-    $log->info("Opened database successfully");
-    $log->info("HOSTNAME $host");
+    #$log->info("Opened database successfully");
+    #$log->info("HOSTNAME $host");
     print "HOSTNAME $host\n";
 
     return $dbh;
@@ -617,10 +622,10 @@ sub _db_connect {
 sub _db_disconnect {
 
     my ( $dbh ) = @_;
-    my $log = Log::Log4perl->get_logger();
+    #my $log = Log::Log4perl->get_logger();
 
     print "DB Operation done successfully\n";
-    $log->info("DB Operation done successfully");
+    #$log->info("DB Operation done successfully");
 
     $dbh->disconnect();
 
@@ -630,10 +635,10 @@ sub _log_init {
 
     # Initialize Logger
     my $log_conf = "$ENV{'HOME'}/ap.log4perl.conf";
-    Log::Log4perl::init($log_conf);
-    my $log = Log::Log4perl->get_logger();
+    #Log::Log4perl::init($log_conf);
+    #my $log = Log::Log4perl->get_logger();
     # sample logging statement
-    $log->info("Initialised logger");
+    #$log->info("Initialised logger");
 
 }
 
@@ -658,7 +663,7 @@ sub get_krids {
 	};
 
 	my $sth = $dbh->prepare($sql);
-	my $rv = $sth->execute(DateTime::Format::Pg->format_timestamptz($tsr_start_dt), DateTime::Format::Pg->format_timestamptz($tsr_end_dt)) or die $DBI::errstr;
+	my $rv = $sth->execute(DateTime::Format::Pg->format_timestamptz($tsr_start_dt), DateTime::Format::Pg->format_timestamptz($tsr_end_dt));
 
 	#print $DBI::errstr if($rv < 0);
 
@@ -709,7 +714,7 @@ sub get_keyrings {
 			WHERE krid IN (%s)
 		;}, join(', ', ('?') x scalar(@$krids_list)));
 
-		my $sth = $dbh->prepare($sql) or die;
+		my $sth = $dbh->prepare($sql);
 		$sth->execute(@$krids_list);
 
 		my $rtkeyrings = $sth->fetchall_arrayref;
@@ -800,7 +805,7 @@ sub get_keyrings {
 		$sth->finish;
 	};
 
-	write_dumper_to_file( "salty_kids.txt", \%salty_kids);
+	#write_dumper_to_file( "salty_kids.txt", \%salty_kids);
 
 	return \%salty_kids;
 
