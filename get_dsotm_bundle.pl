@@ -53,7 +53,12 @@ pod2usage( -verbose => 1 ) if $help;
 #if ($lower_tstz_range ) {
 pod2usage(1) unless ($upper_tstz_range && $lower_tstz_range);
 
-
+my %pg_special_query_columns = (
+	'id'	=> PG_BYTEA,
+	'kid'	=> PG_BYTEA,
+	'datum'	=> PG_BYTEA,
+	'datum_id'	=> PG_BYTEA,
+);
 ################################################################################################
 
 _log_init();
@@ -81,16 +86,17 @@ my $krids = get_krids ( $dbh, $lower_tstz_range, $upper_tstz_range, $oauth_data,
 #   my $user_jwt = $resp_content->{jwt};
 
 #my $keyrings = get_keyrings ( $dbh, $krids, $oauth_data, $resp_content );
-my ( $keyrings, $hkid_hex_hash,
-     $keyring_krid_mapping,
-     $keyring_metadata ) = get_keyrings ( $dbh, $krids, $oauth_data, $resp_content, $input_timerange_span ); #get krid from keyring
+#my ( $keyrings, $hkid_hex_hash,
+#     $keyring_krid_mapping,
+#     $keyring_metadata ) = get_keyrings ( $dbh, $krids, $oauth_data, $resp_content, $input_timerange_span ); #get krid from keyring
 
-#my $salty_kids = get_keyrings($dbh, $krids, $oauth_data, $resp_content, $tsr_start_dt, $tsr_end_dt);
+#my $salty_kids = get_keyrings($dbh, $krids, $oauth_data, $resp_content, $tsr_start, $tsr_end);
+my $salty_kids = get_keyrings($dbh, $krids, $oauth_data, $resp_content, $input_timerange_span );
 
-my $bundle_payloads_secrets = get_bundle_payload ( $dbh, $keyrings,$hkid_hex_hash,$keyring_krid_mapping,
-                                                         $keyring_metadata, $oauth_data, $resp_content );
+#get_bundle_payload ( $dbh, $keyrings,$hkid_hex_hash,$keyring_krid_mapping,
+#                                                         $keyring_metadata, $oauth_data, $resp_content );
 
-
+get_bundle_payload ($dbh, $salty_kids, $oauth_data, $resp_content);
 
 ########################################################################
 ########################################################################
@@ -99,13 +105,20 @@ my $bundle_payloads_secrets = get_bundle_payload ( $dbh, $keyrings,$hkid_hex_has
 # START: add_bundles_for_keyrings()
 # START: get_bundles_for_keyrings()
 #my $max = 5000; ## max number of parameters for DBD::pg
+
+
+
+# START: add_bundles_for_keyrings()
+# START: get_bundles_for_keyrings()
+#my $max = 5000; ## max number of parameters for DBD::pg
 sub get_bundle_payload {
 
-    my ( $dbh, $keyrings,$hkid_hex_hash, $keyring_krid_mapping,
-                $keyring_metadata, $oauth_data, $resp_content ) = @_;
+    my ($dbh, $salty_kids, $oauth_data, $resp_content) = @_;
 
     my $bundle_metadata_secrets={};
     my $bundle_payloads_secrets={};
+
+    my $log = Log::Log4perl->get_logger();
 
     #my %keyring_krid_map = %{$keyring_krid_mapping};
     #my %keyring_md       = %{$keyring_metadata};
@@ -115,30 +128,28 @@ sub get_bundle_payload {
 
 #write_dumper_to_file( "keyring_metadata.txt", \%keyring_md);
 
-    my $max = 65535;
-    foreach my $keyring_keys_list (
-            spart(
-                    $max,
-                    #uniqstr map { $_->{krid} } ( @{$keyrings->{selves}} )
-                    map { $_->{krid} } ( @{$keyrings->{selves}} )
-            )
-    ) {
+    my $max = 4096;
+    #my $krids;
+	foreach my $krids (spart($max, keys(%$salty_kids))) {
 
-        print "keyring_keys_list " . Dumper(@$keyring_keys_list);
+        print "keyring_keys_list " . Dumper( $krids);
+
+        #print "krids type " . ref($krids) . "\n";
+        
 
         my $sql = sprintf(q{
             SELECT krid, metadata, payload
             FROM bundle
             WHERE krid IN (%s)
-        ;}, join(', ', ('?') x scalar(@$keyring_keys_list)));
+        ;}, join(', ', ('?') x scalar(@$krids)));
 
         my $sth = $dbh->prepare($sql) or die;
-        $sth->execute(@$keyring_keys_list);
+        $sth->execute(@$krids);
         #$sth->execute();
 
         my $bundles = $sth->fetchall_hashref('krid');
 
-        #print "DUMPING BUNDLES " . Dumper($bundles) . "\n SQL ". $sql . " JOIN " . join(', ', ('?') x scalar(@$keyring_keys_list)) . "\n";
+        #print "DUMPING BUNDLES " . Dumper($bundles) . "\n SQL ". $sql . " JOIN " . join(', ', ('?') x scalar(@$krids)) . "\n";
 
         $bundle_metadata_secrets = %$bundles
                     ? rsa_decrypt( $oauth_data,
@@ -147,7 +158,7 @@ sub get_bundle_payload {
                                         map {
                                                 $_ => {
                                                     #mk_uuid => $keyring_md{$var}{'mk_uuid'},
-                                                    mk_uuid => $keyring_metadata->{$keyring_krid_mapping->{$_}}->{mk_uuid},
+                                                    mk_uuid => $salty_kids->{$_}{mk_uuid},
                                                     data    => %$bundles{$_}->{"metadata"}
                                                 }
                                         } keys %$bundles
@@ -175,40 +186,53 @@ sub get_bundle_payload {
 
         #return $bundle_payloads_secrets
 
+        $log->info("salty_kids are: " . Dumper($salty_kids) );
+        #print "salty_kids are: " . Dumper($salty_kids);
+
+
+
+        foreach my $krid ( @$krids ) {
+
+            my %bundle_tables;
+            my $kid;
+
+            print "krid " . Dumper( $krid );
+            my $bundle_tables = $bundle_payloads_secrets->{$krid}->{"tables"};
+            print "bundle_metadata_tables " . Dumper($bundle_tables) . "\n";
+
+=begin
+            foreach my $keyring ( @{ $keyrings->{'selves'} } ) {
+                if ( $keyring->{'krid'} eq $krid ) {
+
+                    $bundle_tables{"search"} = %$bundle_payloads_secrets{$krid}->{"tables"}->{"search"};
+                    $bundle_tables{"link"}   = %$bundle_payloads_secrets{$krid}->{"tables"}->{"link"};
+                    $bundle_tables{"stash"}  = %$bundle_payloads_secrets{$krid}->{"tables"}->{"stash"};
+                    $bundle_tables{"brick"}  = %$bundle_payloads_secrets{$krid}->{"tables"}->{"brick"};
+
+                    #
+                    print "krid in bundle_payload_secrets $krid\n";
+                    print "bundle search table bundle_search.".$bundle_tables{"search"}."\n";
+                    print "bundle link   table bundle_link.".$bundle_tables{"link"}."\n";
+                    print "bundle stash  table bundle_stash.".$bundle_tables{"stash"}."\n";
+                    print "bundle brick  table bundle_brick.".$bundle_tables{"brick"}."\n";
+                    #
+                    #print "keyring krid:           $keyring->{'krid'}\n";
+                    #print "keyring plaintext kid:  $keyring->{'kid'}\n";
+                    #print "keyring hkid:           $keyring->{'hkid'}\n";
+
+                    $kid = $keyring->{'kid'};
+                }
+            }
+=cut
+            #search_bundle_search( $hkid_hex_hash, $kid, \%bundle_tables );
+            search_bundle_search($salty_kids, $krid, $bundle_tables);
+
+        } ## end foreach my $bundle (@$bundles)
+
+
+
     }
 
-
-
-	foreach my $krid ( keys %$bundle_payloads_secrets) {
-
-        my %bundle_tables;
-        my $kid;
-
-        foreach my $keyring ( @{ $keyrings->{'selves'} } ) {
-            if ( $keyring->{'krid'} eq $krid ) {
-
-                $bundle_tables{"search"} = %$bundle_payloads_secrets{$krid}->{"tables"}->{"search"};
-                $bundle_tables{"link"}   = %$bundle_payloads_secrets{$krid}->{"tables"}->{"link"};
-                $bundle_tables{"stash"}  = %$bundle_payloads_secrets{$krid}->{"tables"}->{"stash"};
-                $bundle_tables{"brick"}  = %$bundle_payloads_secrets{$krid}->{"tables"}->{"brick"};
-
-                #
-                print "krid in bundle_payload_secrets $krid\n";
-                print "bundle search table bundle_search.".$bundle_tables{"search"}."\n";
-                print "bundle link   table bundle_link.".$bundle_tables{"link"}."\n";
-                print "bundle stash  table bundle_stash.".$bundle_tables{"stash"}."\n";
-                print "bundle brick  table bundle_brick.".$bundle_tables{"brick"}."\n";
-                #
-                #print "keyring krid:           $keyring->{'krid'}\n";
-                #print "keyring plaintext kid:  $keyring->{'kid'}\n";
-                #print "keyring hkid:           $keyring->{'hkid'}\n";
-
-                $kid = $keyring->{'kid'};
-            }
-        }
-        search_bundle_search( $hkid_hex_hash, $kid, \%bundle_tables );
-
-	} ## end foreach my $bundle (@$bundles)
     #print "DUMPING BUNDLES ". Dumper (@$bundles) . "\n";
 
 }
@@ -216,24 +240,12 @@ sub get_bundle_payload {
 #print "hkid_hex_hash " . Dumper(\%hkid_hex_hash);
 
 sub search_bundle_search {
-    my ( $hkid_hex_hash, $kid, $bundle_tables ) = @_;
-    #my $log = Log::Log4perl->get_logger("My::MegaPackage");
+	my ( $salty_kids, $krid, $bundle_tables ) = @_;
+
     my $log = Log::Log4perl->get_logger();
-
-    my @hkid_hex = grep { $hkid_hex_hash->{$_}->{"secrets"}->{"kid"} eq $kid } keys %{$hkid_hex_hash};
-    #my $var = $hkid_hex[0];
-
-    $log->info( "Array hkid_hex is  =>>>  " . Dumper( \@hkid_hex ) );
-    #$log->info( "hkid_hex[0] is ==>>>  " . $var );
-
-    my $search_id = $hkid_hex_hash->{$hkid_hex[0]}->{'searchId'};
-    #print "hkid_hex ". Dumper( \@hkid_hex ) ."\n";
-    #print "hkid_hex ZERO ". $hkid_hex[0] ."\n";
 
     my $bundle_search = %$bundle_tables{"search"};
     my $bundle_search_table = $dbh->quote_identifier( undef, "bundle_search", $bundle_search );
-    #print "bundle_search_table is $bundle_search_table";
-    #my $search_stmt = "SELECT id, kid, datum FROM $bundle_search_table WHERE encode(kid,\'hex\') = ?";
 
     my $search_stmt =  "SELECT
                             id,
@@ -243,151 +255,182 @@ sub search_bundle_search {
                             $bundle_search_table
                         WHERE
                             kid = ?";
-
-    my $sth;
     $dbh->begin_work or die $dbh->errstr;
-    $sth = $dbh->prepare("DECLARE bundle_search_cursor NO SCROLL CURSOR WITHOUT HOLD FOR $search_stmt") or die;
-    $sth->bind_param( 1, $hkid_hex[0] , { 'pg_type' => PG_BYTEA } );
-    $sth->execute;
+	my $declare_sth = $dbh->prepare("DECLARE bundle_search_cursor NO SCROLL CURSOR WITHOUT HOLD FOR $search_stmt");
+	foreach my $the_all_kid (keys(%{$salty_kids->{$krid}{kids}})) {
+		$log->info("search: allkid: krid: $krid all_kid: " . Dumper($the_all_kid) . " dt kids: " . Dumper($salty_kids->{$krid}{kids}{$the_all_kid}) );
+		foreach my $the_dt_kid (keys(%{$salty_kids->{$krid}{kids}{$the_all_kid}})) {
+			$declare_sth->bind_param(1, $the_dt_kid, { 'pg_type' => PG_BYTEA } );
+			$declare_sth->execute;
 
+			my $sth = $dbh->prepare("FETCH 10000 FROM bundle_search_cursor");
+            print("OPEN bundle_search_cursor\n");
+			while (1) {
+				$sth->execute();
+				$log->info("search: dtkid:  krid: $krid" . " rows: " .  $sth->rows);
+                print("\nsearch: dtkid:  krid: $krid " . " rows: " .  $sth->rows);
 
-    while (1) {
-        $sth = $dbh->prepare("FETCH 10000 FROM bundle_search_cursor");
-        $sth->execute;
+				last if $sth->rows == 0;
+				my $search_hash_refs = $sth->fetchall_hashref('id');
+				#print "search_hash_refs ". Dumper($search_hash_refs);   ### search_hash_refs in binary
 
+				my $secretcount=0;
+				my $search_refs = %$search_hash_refs ?
+					cbc_decrypt_key({
+						map {
+							my $id = $search_hash_refs->{$_}->{"id"};
 
-        last if $sth->rows == 0;
-        my $search_hash_refs = $sth->fetchall_hashref( 'id' );
-        print "Rows fetched for kid $kid COUNT " . $sth->rows ."\n";
-        $log->info("Rows fetched for kid $kid COUNT " . $sth->rows);
-        #print "search_hash_refs ". Dumper($search_hash_refs);   ### search_hash_refs in binary
+							#unless (++$secretcount%($sqlfetch/10)) {
+								#$log->info("searchkeys: metaed $secretcount searchables");
+							#};
+							$id => {
+								data => $id,
+								key  => $salty_kids->{$krid}{kids}{$the_all_kid}{$the_dt_kid}->{'search_id'},
+								#flip_hash_keyval => 1, # AP: 20190611: we use this in place of data elsewhere
+							}; # encrypted search.id => decrypted search.id
+						} keys %$search_hash_refs
+					}) : {};
 
-        my $search_refs = %$search_hash_refs ?
-                        cbc_decrypt_key({
-                                            map {
-                                                    my $id = %$search_hash_refs{$_}->{"id"};
+				#print "search_refs ". Dumper($search_refs);
 
-                                                    unpack( "H*", $id ) => {
-                                                            data => $id,
-                                                            key  => $search_id
-                                                    }
-                                            } keys %$search_hash_refs
-                                        }) : {};
+				write_dumper_to_file( "bundle_search.txt", $search_refs);
 
-        #print "search_refs ". Dumper($search_refs);
-
-        #write_dumper_to_file( "bundle_search.txt", $search_refs);
-
-        #print "DUMPING secrets salt links  ". $hkid_hex_hash{$hkid_hex[0]}{'secrets'}{'salt'}{'link'} . "\n";
-
-        foreach my $hkid_hex_01 (keys %$search_refs)
-        {
-            my $uuid = %$search_refs{$hkid_hex_01};
-            search_bundle_link( $hkid_hex_hash, $uuid, $hkid_hex[0], $bundle_tables );
-        }
-
-    }
-    $dbh->do("CLOSE bundle_search_cursor");
-    print("CLOSE bundle_search_cursor\n");
-    $log->info("CLOSE bundle_search_cursor");
-    #$dbh->rollback or die $dbh->errstr;   #OR #$dbh->commit;
-    $dbh->commit or die $dbh->errstr;   #OR #$dbh->commit;
-    $log->info("ROLLBACK postgres transaction");
+				#search_bundle_link($salty_kids, $search_refs, $krid, $the_all_kid, $the_dt_kid, $bundle_tables, $nuke_search_rows, $keep_search_rows);
+				search_bundle_link($salty_kids, $search_refs, $krid, $the_all_kid, $the_dt_kid, $bundle_tables);
+				# XXX: debug
+				#$sth->finish; last;
+				#if ($bailonnukecount && $nukecount > $nukemax) { last; }
+			}
+			$dbh->do("CLOSE bundle_search_cursor");
+            print("CLOSE bundle_search_cursor\n");
+            $dbh->rollback or die $dbh->errstr;  #OR #$dbh->commit;
+			#if ($bailonnukecount && $nukecount > $nukemax) { last; }
+		}
+	}
+	#my @nukeables = grep { !exists $keep_search_rows->{$_} } keys(%$nuke_search_rows);
+	#pdebug("counts: keep_search_rows, nuke_search_rows, nukeables: %d %d %d", scalar(keys(%$keep_search_rows)), scalar(keys(%$nuke_search_rows)), scalar(@nukeables));
+	#pdebug("nukeables: ", mlnp(@nukeables)_);
+	#print("CLOSE bundle_search_cursor_$$\n");
+	#$log->info("CLOSE bundle_search_cursor_$$");
 }
 
+
+
 sub search_bundle_link {
-        my ( $hkid_hex_hash, $uuid, $hkid_hex, $bundle_tables ) = @_;
+        #my ( $hkid_hex_hash, $uuid, $hkid_hex, $bundle_tables ) = @_;
+        my ($salty_kids, $search_refs, $krid, $the_all_kid, $the_dt_kid, $bundle_tables) = @_;
         my $log = Log::Log4perl->get_logger();
 
-        my $salt_link = $hkid_hex_hash->{$hkid_hex}->{'secrets'}->{'salt'}->{'link'};
-        my $link_ids  = $hkid_hex_hash->{$hkid_hex}->{'secrets'}->{'skeys'}->{'link_ids'};
-
+        my $the_salty_kid = $salty_kids->{$krid}{kids}{$the_all_kid}{$the_dt_kid};
+        my $salt_link = $the_salty_kid->{'secrets'}->{'salt'}->{'link'};
+        my $link_ids  = $the_salty_kid->{'secrets'}->{'skeys'}->{'link_ids'};
+	    my $salt_link_bin = pack('H*', $salt_link);
         ###################print "plaintext uuid ". $uuid . "\n";
         ###################print "hkid_hex_hash link table salt " . $salt_link . "\n";
         ###################print "hkid_hex_hash linkids " . $link_ids . "\n";
+        my $max = 4096;
+        foreach my $searchids_enc (spart($max, keys %$search_refs)) { #
+            my %datumids;
+            foreach my $searchid_enc (@$searchids_enc) {
+                my $datumid = pbkdf2(
+                    $search_refs->{$searchid_enc},
+                    $salt_link_bin,
+                    $the_salty_kid->{'secrets'}->{'pdkargs'}->{'iters'},
+                    $the_salty_kid->{'secrets'}->{'pdkargs'}->{'hash'},
+                    $the_salty_kid->{'secrets'}->{'pdkargs'}->{'dklen'}
+                );
+                #$datumids{$datumid} = $search_refs->{$searchid}; # AP: 20160911: this gives us the db value of search.id
+                $datumids{$datumid} = $searchid_enc; # link salted search.id => search salted search.id
+            };
 
-        my $datum_id = pbkdf2(
-            $uuid,
-            pack( 'H*', $salt_link ),
-            $hkid_hex_hash->{$hkid_hex}->{'secrets'}->{'pdkargs'}->{'iters'},
-            $hkid_hex_hash->{$hkid_hex}->{'secrets'}->{'pdkargs'}->{'hash'},
-            $hkid_hex_hash->{$hkid_hex}->{'secrets'}->{'pdkargs'}->{'dklen'}
-        );
-        ###################print "pbkdf2 hashed uuid ". $datum_id . "\n";
+            my $bundle_link = %$bundle_tables{"link"};
+            my $bundle_link_table = $dbh->quote_identifier( undef, "bundle_link", $bundle_link );
 
-        my $hashed_uuid =  unpack("H*",$datum_id);  # output hashed datum_id as hexadecimal
+            my $query_column = 'datum_id';
+            my $sql = sprintf(q{
+                SELECT datum_id, ids
+                FROM %s
+                WHERE %s IN (%s)
+            ;},
+                $bundle_link_table,
+                $query_column,
+                join(',', ('?') x keys(%datumids))
+            );
 
-        ###################print "hashed uuid as hexadecimal ==> ". $hashed_uuid . "\n";
-
-        my $bundle_link = %$bundle_tables{"link"};
-        my $bundle_link_table = $dbh->quote_identifier( undef, "bundle_link", $bundle_link );
-
-        my $sql = "SELECT
-                        datum_id,
-                        ids
-                   FROM
-                        $bundle_link_table
-                   WHERE
-                        datum_id = ?";
-
-        #$dbh->begin_work or die $dbh->errstr;
-        my $sth = $dbh->prepare("DECLARE bundle_link_cursor NO SCROLL CURSOR WITHOUT HOLD FOR $sql") or die;
-        $sth->bind_param( 1, $datum_id, { 'pg_type' => PG_BYTEA } );
-        $sth->execute;
-
-
-
-        #my $sth = $dbh->prepare($sql) or die;
-
-        while (1) {
-            $sth = $dbh->prepare("FETCH 10000 FROM bundle_link_cursor");
+            my $sth = $dbh->prepare("DECLARE bundle_link_cursor NO SCROLL CURSOR WITHOUT HOLD FOR $sql");
+            print("OPEN bundle_link_cursor\n");
+            my $cnt = 1;
+            foreach my $data (keys(%datumids)) {
+                if ($pg_special_query_columns{$query_column}) {
+                    $sth->bind_param($cnt++, $data, { 'pg_type' => $pg_special_query_columns{$query_column} });
+                } else {
+                    $sth->bind_param($cnt++, $data);
+                }
+            };
             $sth->execute;
+            $sth = $dbh->prepare("FETCH 10000 FROM bundle_link_cursor;");
 
+            my $fetchcnt = 0;
+            while (1) {
+                $sth->execute;
 
-            last if $sth->rows == 0;
-            my $link_hash_refs = $sth->fetchall_hashref( 'datum_id' );
-            #print "Rows fetched from $bundle_link_table for datum_id $hashed_uuid COUNT " . $sth->rows ."\n";
-            $log->info("Rows fetched from $bundle_link_table for datum_id $hashed_uuid COUNT " . $sth->rows);
-            #print "search_hash_refs ". Dumper($search_hash_refs);   ### search_hash_refs in binary
+                $log->info("link: krid: $krid " . " rows:" . $sth->rows);
+                #########################print("    link: krid: $krid " . " rows:" . $sth->rows ."\n");
 
-            my $link_refs = %$link_hash_refs
-                    ? cbc_decrypt_key( {
-                            map {
-                                    my $ids = %$link_hash_refs{$_}->{'ids'};
-                                    unpack( "H*", $ids ) => {
-                                            data => $ids,
-                                            key  => $link_ids,
-                                    }
-                            } keys %$link_hash_refs
-                    }) : {};
+                # XXX: debug 
+                #$sth->finish; last
+                last if ($sth->rows == 0);
+                my $fetched = $sth->rows;
+                $fetchcnt += $fetched;
+                #$log->info("link: fetched " . $fetchcnt . " links");
+                #printf("    link: fetched %s links", $fetchcnt);
 
-            #print "search_refs ". Dumper($search_refs);
+                #my $links_enc = $sth->fetchall_hashref( 'datum_id' );
+                my $links_enc = $sth->fetchall_arrayref({});
+                #pdebug("link: links_enc: %s", mlnp($links_enc));
 
-            #write_dumper_to_file( "bundle_search.txt", $search_refs);
-            $log->info("$bundle_link_table LINK REFS " . Dumper($link_refs) );
+                my $secretcount=0;
+                #my $links_dec = %$links_enc
+                my $links_dec = @$links_enc
+                    ? cbc_decrypt_array( [
+                        map {
+                            #my $ids = $links_enc->{$_}->{'ids'};
+                            my $ids = $_->{'ids'};
+                            #unless (++$secretcount%($sqlfetch/10)) {
+                            #    $log->info("linkkeys: metaed %s links", $secretcount);
+                            #};
+                            {
+                                data_enc => $ids,
+                                key      => $link_ids,
+                                extra    => { datum_id => $_->{'datum_id'} },
+                            }
+                        #} keys %$links_enc
+                        } @$links_enc
+                    ]) : [];
+                ################print("link: links_dec: ". Dumper($links_dec));
 
-            #print "DUMPING secrets salt links  ". $hkid_hex_hash{$hkid_hex[0]}{'secrets'}{'salt'}{'link'} . "\n";
-
-            foreach my $hkid_hex_01 (keys %$link_refs)
-            {
-                my $uuid = %$link_refs{$hkid_hex_01};
-
-                #print "plaintext uuid ". $uuid . "\n";
-                #print "hkid_hex_hash link table salt " . $salt_link . "\n";
-
-                search_stash_brick( $datum_id, $link_refs, $hkid_hex_hash->{$hkid_hex}, $input_timerange_span, $bundle_tables );  #Is searching in search_stash needed????
-
-                #search_brick( $link_refs, $hkid_hex_hash->{$hkid_hex}, $input_timerange_span, $bundle_tables );  #Is searching in search_stash needed????
-
+                my $stashcnt = 0;
+                write_dumper_to_file( "salty_kid.txt", $the_salty_kid);
+                #filter_links_and_nuke_prep($the_salty_kid, $the_dt_kid, $links_dec, $search_refs, \%datumids, $bundle_tables, $nuke_search_rows, $keep_search_rows);
+                #filter_links_and_nuke_prep($the_salty_kid, $the_dt_kid, $links_dec, \%datumids, $bundle_tables, $fetched);
+                search_stash_brick( $the_salty_kid, $the_dt_kid, $links_dec, $input_timerange_span, $bundle_tables );
+                #if ($bailonnukecount && $nukecount > $nukemax) { last; }
             }
-
+            $dbh->do("CLOSE bundle_link_cursor");
+            print "CLOSE bundle_link_cursor\n";
+            #if ($bailonnukecount && $nukecount > $nukemax) { last; }
         }
-        $dbh->do("CLOSE bundle_link_cursor");
-        #$dbh->rollback or die $dbh->errstr;  #OR #$dbh->commit;
-        #$dbh->commit or die $dbh->errstr;  #OR #$dbh->rollback;
-
-
 }
+
+=begin comment
+
+
+
+
+=end comment
+
+=cut
+
 #############################################################################################
 #############################################################################################
 #############################################################################################
@@ -395,21 +438,26 @@ sub search_bundle_link {
 _db_disconnect($dbh);
 
 sub search_stash_brick {
-    my ( $datum_id, $lkrfs, $hkid_hex_hash_ref, $input_timerange_span, $bundle_tables ) = @_;
+    #my ( $datum_id, $lkrfs, $hkid_hex_hash_ref, $input_timerange_span, $bundle_tables ) = @_;
+
+    my ( $the_salty_kid, $the_dt_kid, $links_dec, $input_timerange_span, $bundle_tables ) = @_;
 
     my $log = Log::Log4perl->get_logger();
     #print "hkid_hex_hash_ref secrets PRINT " . Dumper($hkid_hex_hash_ref);
     #print "hkid_hex_hash_ref pdkargs PRINT " . Dumper($hkid_hex_hash_ref->{pdkargs});
 
-    foreach my $key (keys %$lkrfs) {
+    #foreach my $key (keys %$links_dec) {
+    foreach my $link_dec (@$links_dec) {
 
         #print "GLOBAL_ALLOWED_DATATYPES " . Dumper \%GLOBAL_ALLOWED_DATA_TYPES;
         my $GLOBAL_ALLOWED_DATA_TYPES = \%GLOBAL_ALLOWED_DATA_TYPES;
 
-        my $data = %$lkrfs{$key};
-        #print "data PRINT " . Dumper($data);
+        my $data = %$link_dec{'data_dec'};
+        #################print "data PRINT " . Dumper($data);
         #my $link_data = JSON->new->utf8->decode($data);
         my $link_data = newjson()->decode($data);
+        #################print "data PRINT " . Dumper($link_data);
+
 
         $log->info( "link data PRINT " . Dumper($link_data) );
 
@@ -427,10 +475,21 @@ sub search_stash_brick {
         #my $timerange_span = DateTime::Span->from_datetimes( start => $start_dt, end => $end_dt );
         #$log->info("DATATYPE " . $link_data->{dt} . " EXISTS. link table contains " . Dumper $GLOBAL_ALLOWED_DATA_TYPES{ $link_data->{dt} } );
 
-
+        my $stash_id_enc;
         my $bundle_stash = %$bundle_tables{"stash"};
         my $bundle_brick = %$bundle_tables{"brick"};
 
+        if ( exists $link_data->{'stash_id'} ) {
+            #print "stash_id PRINT " . %$link_data{$link_key} . "\n";
+
+            $stash_id_enc = pbkdf2(
+                $link_data->{stash_id},
+                pack( 'H*', $the_salty_kid->{'secrets'}->{'salt'}->{'stash'} ),
+                $the_salty_kid->{'secrets'}->{'pdkargs'}->{'iters'},
+                $the_salty_kid->{'secrets'}->{'pdkargs'}->{'hash'},
+                $the_salty_kid->{'secrets'}->{'pdkargs'}->{'dklen'}                    
+            );
+        }
 
         if ( $input_timerange_span->contains( $end_dt ) &&
              #$input_timerange_span->contains( $start_dt ) &&
@@ -439,19 +498,11 @@ sub search_stash_brick {
             $log->info("TIMERANGE CONSTRAINT satisfied DATATYPE CONSTRAINT satisfied " . $link_data->{dt} . " ==>> GOOD TO GO");
             $log->info("DATATYPE " . $link_data->{dt} . " EXISTS. link table contains " . Dumper $GLOBAL_ALLOWED_DATA_TYPES{ $link_data->{dt} } );
 
-
             #print "link data PRINT " . Dumper($link_data);
+            
 
             if ( exists $link_data->{'stash_id'} ) {
                 #print "stash_id PRINT " . %$link_data{$link_key} . "\n";
-
-                my $stash_id_enc = pbkdf2(
-                    $link_data->{stash_id},
-                    pack( 'H*', $hkid_hex_hash_ref->{secrets}->{salt}->{stash} ),
-                    $hkid_hex_hash_ref->{secrets}->{pdkargs}->{iters},
-                    $hkid_hex_hash_ref->{secrets}->{pdkargs}->{hash},
-                    $hkid_hex_hash_ref->{secrets}->{pdkargs}->{dklen}
-                );
 
                 #print "stash_id_enc $stash_id_enc\n";
 
@@ -465,7 +516,7 @@ sub search_stash_brick {
                 $log->info("TESTING query ==>>>  select * from bundle_stash.$bundle_stash where encode(id,'hex') = '$hexed_stash_id'; ");
 
                 my $sth = $dbh->prepare("INSERT INTO flush_datum_id(datum_id) VALUES (?)") or warn $DBI::errstr;
-                $sth->bind_param( 1, $datum_id, { 'pg_type' => PG_BYTEA } );
+                $sth->bind_param( 1, $stash_id_enc, { 'pg_type' => PG_BYTEA } );
                 $sth->execute();
                 $sth->finish();
 
@@ -478,7 +529,7 @@ sub search_stash_brick {
                 #$sth->bind_param( 1, $datum_id, { 'pg_type' => PG_BYTEA } );
                 #$sth->execute();
                 my $sth = $dbh->prepare("INSERT INTO retain_datum_id(datum_id) VALUES (?)") or warn $DBI::errstr;
-                $sth->bind_param( 1, $datum_id, { 'pg_type' => PG_BYTEA } );
+                $sth->bind_param( 1, $stash_id_enc, { 'pg_type' => PG_BYTEA } );
                 $sth->execute();
                 $sth->finish();
         }
@@ -498,10 +549,10 @@ sub search_stash_brick {
 
                     my $brick_id_enc = pbkdf2(
                         $link_data->{stash_id}."/".$brick_id,
-                        pack( 'H*', $hkid_hex_hash_ref->{secrets}->{salt}->{brick} ),
-                        $hkid_hex_hash_ref->{secrets}->{pdkargs}->{iters},
-                        $hkid_hex_hash_ref->{secrets}->{pdkargs}->{hash},
-                        $hkid_hex_hash_ref->{secrets}->{pdkargs}->{dklen}
+                        pack( 'H*', $the_salty_kid->{secrets}->{salt}->{brick} ),
+                        $the_salty_kid->{secrets}->{pdkargs}->{iters},
+                        $the_salty_kid->{secrets}->{pdkargs}->{hash},
+                        $the_salty_kid->{secrets}->{pdkargs}->{dklen}
                     );
 
                     #print "brick_id_enc $brick_id_enc\n";

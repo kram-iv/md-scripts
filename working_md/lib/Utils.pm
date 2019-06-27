@@ -30,9 +30,6 @@ use DateTime::Format::Pg;
 use List::NSect qw(spart);
 use List::Util qw(uniq uniqstr any all sum0);
 
-#use DateTime::Span;
-#use DateTime::Format::ISO8601;
-
 our @EXPORT = qw( write_dumper_to_file
                     _db_connect
                     _db_disconnect _log_init
@@ -78,7 +75,7 @@ Readonly our %GLOBAL_ALLOWED_DATA_TYPES => (
 		'mailw'		=> {'*'	=> 1},
 		'invoice'	=> {'*'	=> 1},
 		'payment'	=> {'*'	=> 1},
-        'smslog'	=> {'*' => 1},
+                'smslog'	=> {'*' => 1},
 		#'smslog'	=> {
 		#	'sms2email'		=> 1,	'sms2emailpickup'	=> 1,
 		#	'sms2apiin'		=> 1,	'sms2apipickup'		=> 1,
@@ -97,8 +94,7 @@ sub write_dumper_to_file {
     my ( $filename, $ds_dumper_name ) = @_;
     #my $filename = 'report.txt';
     open(my $fh, '>', $filename) or die "Could not open file '$filename' $!";
-    $Data::Dumper::Sortkeys = 1;
-    print $fh Dumper( $ds_dumper_name );
+    print $fh Dumper( $ds_dumper_name ) . "\n";
     close $fh;
 }
 
@@ -696,118 +692,187 @@ sub get_krids {
 }
 
 sub get_keyrings {
-	my ( $dbh, $krids, $oauth_data, $resp_content, $input_timerange_span ) = @_;
-    #my ( $dbh, $krids, $oauth_data, $resp_content, $input_timerange_span ) = @_;
 
-	my %salty_kids;
-    my $log = Log::Log4perl->get_logger();
+    my ( $dbh, $krids, $oauth_data, $resp_content, $input_timerange_span ) = @_;
 
-	my $max = 4096; ## max number of parameters for DBD::pg
-	foreach my $krids_list ( spart( $max, keys %$krids ) ) {
-		my $sql = sprintf(q{
-			SELECT krid, metadata, keys
-			FROM keyring
-			WHERE krid IN (%s)
-		;}, join(', ', ('?') x scalar(@$krids_list)));
+        my $keyring_keys = [];
+        my $ts_range_type = "selves";
+        my %keyrings;
+        my %hkid_hex_hash;
 
-		my $sth = $dbh->prepare($sql);
-		$sth->execute(@$krids_list);
+        my $keyring_metadata_secrets = {};
+        my $keyring_keys_secrets = {};
+        my $keyring_hkid_mapping = {};
 
-		my $rtkeyrings = $sth->fetchall_arrayref;
+        my %keyring_krid_mapping;
+        my %keyring_metadata;
 
-		# $mds in old code
-		my $keyring_metadata_secrets = @$rtkeyrings
-			? rsa_decrypt(
-				$oauth_data,
-				$resp_content,
-				{
-					map {    #print "\n DECRYPT mk_uuid for keyring table ==>> " . $krids->{$_->[0]}->{mk_uuid} ."\n";
-						$_->[0] => { mk_uuid => $krids->{$_->[0]}->{mk_uuid}, data => $_->[1] }
-					} @$rtkeyrings
-				}
-			)
-			: {}; ## ( $krid, $key, $metadata, $tsr ) -> { $krid => $metadata }
 
-		my $keyring_keys_secrets = @$rtkeyrings
-			? cbc_decrypt_md(
-				$oauth_data,
-				$resp_content,
-				{
-					map {
-						$_->[0] => {
-							data     => $_->[2],
-							metadata => $keyring_metadata_secrets->{$_->[0]}
-						}
-					} @$rtkeyrings
-				}
-			)
-			: {};
+        my $max = 65535; ## max number of parameters for DBD::pg
+        my $log = Log::Log4perl->get_logger();
 
-		foreach my $keyring (@$rtkeyrings) {
-			my ($krid) = @$keyring;
-			my $skeyring = $keyring_keys_secrets->{$krid};
+        my $strp = DateTime::Format::Strptime->new(
+            pattern   => '%FT%T%z',
+        );
+        #printf ( "darksides or krids: %s", Dumper($darksides) );
 
-			if ($skeyring->{version} eq '8') {
-				my $sess_secrets = $skeyring->{secrets};
-				$sess_secrets->{mk_uuid} = $krids->{$krid}->{mk_uuid};
+        #foreach my $krids_list ( spart( $max, uniqstr keys %$krids ) ) {
+        foreach my $krids_list ( spart( $max, keys %$krids ) ) {
 
-				my $salty_all_kid = pbkdf2(
-					$sess_secrets->{kid},
-					pack( 'H*', $sess_secrets->{salt}->{search_kid} ),
-					$sess_secrets->{pdkargs}->{iters},
-					$sess_secrets->{pdkargs}->{hash},
-					$sess_secrets->{pdkargs}->{dklen}
-				);
+                my $sql = sprintf(q{
+                        SELECT krid, metadata, keys
+                        FROM keyring
+                        WHERE krid IN (%s)
+                ;}, join(', ', ('?') x scalar(@$krids_list)));
 
-				my (@dt_kids, @dt_hkids, @dt_data_types, @dt_timeranges);
-				printf("keyring:%s all timerange: %s", $krid, Dumper($sess_secrets->{logts_range}) );
+                my $sth = $dbh->prepare($sql) or die;
+                $sth->execute(@$krids_list);
 
-				my $strp = DateTime::Format::Strptime->new(
-					pattern   => '%FT%T%z',
-				);
+                my $rtkeyrings = $sth->fetchall_arrayref;
 
-				foreach my $dtype_info (@{$skeyring->{info}}) {
+                #print("decrypting metadata for %d keyring records\n", scalar @$rtkeyrings);
+                #debug('encrypted metadata: %s',np($rtkeyrings));
 
-                    my $start_dt = $strp->parse_datetime( $dtype_info->{logts_range}->{start} );
-                    my $end_dt   = $strp->parse_datetime( $dtype_info->{logts_range}->{end} );
+                # $mds in old code
+                $keyring_metadata_secrets =
+                    @$rtkeyrings
+                  ? rsa_decrypt(
+                                $oauth_data,
+                                $resp_content,
+                                { 
+                                        map {    #print "\n DECRYPT mk_uuid for keyring table ==>> " . $krids->{$_->[0]}->{mk_uuid} ."\n";
+                                                $_->[0] => { mk_uuid => $krids->{$_->[0]}->{mk_uuid}, data => $_->[1] } 
+                                        } @$rtkeyrings
+                                }
+                            )
+                  : {}; ## ( $krid, $key, $metadata, $tsr ) -> { $krid => $metadata }
 
-                    unless ( $input_timerange_span->contains( $end_dt ) &&
-                            $input_timerange_span->contains( $start_dt ) && 
-                            $GLOBAL_ALLOWED_DATA_TYPES{$dtype_info->{data_type}} ) {
+                #printf("decrypted metadata for %d keyring records\n", scalar keys %$keyring_metadata_secrets);
+                #debug('decrypted metadata: %s', np($keyring_metadata_secret));
 
-                        $log->info( "keyring: $krid keep data: " . Dumper($dtype_info) );
-                        next;
-                    }
-					printf("keyring:%s nuke data: %s", $krid, Dumper($dtype_info) );
+                #print("decrypted keys for keyring records DUMPER " . Dumper($keyring_metadata_secrets) );
+                # $skrs in old code
+                $keyring_keys_secrets = @$rtkeyrings
+                  ? cbc_decrypt_md( $oauth_data,
+                                    $resp_content,
+                            {
+                                map {
+                                        $_->[0] => {
+                                                data     => $_->[2],
+                                                metadata => $keyring_metadata_secrets->{$_->[0]}
+                                          }
+                                } @$rtkeyrings
+                        }
+                  )
+                  : {};
 
-					my $salty_kid = pbkdf2(
-						$dtype_info->{kid},
-						pack('H*', $sess_secrets->{salt}->{search_kid}),
-						$sess_secrets->{pdkargs}->{iters},
-						$sess_secrets->{pdkargs}->{hash},
-						$sess_secrets->{pdkargs}->{dklen}
-					);
+                ######################printf("decrypted keys for %d keyring records\n", scalar keys %$keyring_keys_secrets);
+                #debug('decrypted keys: %s', np($keyring_keys_secret));
+                ######################printf("decrypted keys: %s\n", Dumper($keyring_keys_secrets) );
+        #        $self->set_keyring_keys_secret(%$skrs) if %$skrs;    # can't set keys with empty hash
+                ######################print( "rtkeyrings DUMPER \n", Dumper(@$rtkeyrings) );
 
-					# AP: 20190611: we do this here so that we don't have to count kids later and decide then.
-					$salty_kids{$krid}{mk_uuid} = $krids->{$krid}->{mk_uuid};
-					# salty_kids{keyring_id}{"kids"}{all_kid}{dtype_kid}{...}
-					$salty_kids{$krid}{kids}{$salty_all_kid}{$salty_kid}{'search_id'} = $sess_secrets->{skeys}->{search_id};
-					$salty_kids{$krid}{kids}{$salty_all_kid}{$salty_kid}{'dt_info'}   = $dtype_info;
-					#$salty_kids{$krid}{kids}{$salty_all_kid}{$salty_kid}{'dt_info'}->{logts_range}->{start_dt} = $logts_start_dt;
-					#$salty_kids{$krid}{kids}{$salty_all_kid}{$salty_kid}{'dt_info'}->{logts_range}->{end_dt} = $logts_end_dt;
-					$salty_kids{$krid}{kids}{$salty_all_kid}{$salty_kid}{'secrets'}   = $sess_secrets;
-				}
-			} else {
-				print "Keyring key/metadata unsupported version\n";
-				die;
-			}
-		} ## end foreach my $keyring (@$rtkeyrings)
-		$sth->finish;
-	};
+                foreach my $keyring (@$rtkeyrings) {
+                        my ( $krid, $metadata, $key ) = @$keyring;
+                        my $skeyring = $keyring_keys_secrets->{$krid};
 
-	write_dumper_to_file( "salty_kids.txt", \%salty_kids);
+                        print( "skeyring DUMPER \n", Dumper($skeyring) );   ##########################
 
-	return \%salty_kids;
+                        if ($skeyring->{version} eq '8') {
+                                #printf( "INSIDE IF version %d CONFIRMED \n", $skeyring->{version} );
+                                my $sess_secrets = $skeyring->{secrets};
+                                $sess_secrets->{mk_uuid} = $krids->{$krid}->{mk_uuid};
+
+                                my $hkid = pbkdf2(
+                                    $sess_secrets->{kid},
+                                    pack( 'H*', $sess_secrets->{salt}->{search_kid} ),
+                                        $sess_secrets->{pdkargs}->{iters},
+                                        $sess_secrets->{pdkargs}->{hash},
+                                        $sess_secrets->{pdkargs}->{dklen}
+                                );
+                                $sess_secrets->{hkid} = $hkid;
+                                $keyring_hkid_mapping->{$hkid} = $sess_secrets->{kid};
+
+                                foreach my $dtype_info (@{$skeyring->{info}}) {
+
+                                    print "dtype_info INFO " . Dumper($dtype_info);          ##################
+                                    print "dtype_info kid " . Dumper( $dtype_info->{kid} );  ##################
+
+                                    my $start_dt = $strp->parse_datetime( $dtype_info->{logts_range}->{start} );
+                                    my $end_dt   = $strp->parse_datetime( $dtype_info->{logts_range}->{end} );
+
+                                    #unless ( $input_timerange_span->contains( $end_dt ) &&
+                                    #        $input_timerange_span->contains( $start_dt ) && 
+                                    #        $GLOBAL_ALLOWED_DATA_TYPES{$dtype_info->{data_type}} ) {
+
+                                    #   $log->info( "keyring: $krid keep data: " . Dumper($dtype_info) );
+                                    #    next;
+                                    #}
+
+                                    print "keyring: $krid nuke data: " . Dumper( $dtype_info );
+                                    $log->info( "keyring: $krid nuke data: " . Dumper( $dtype_info ) );
+
+                                    my $dtype_hkid = pbkdf2(
+                                            $dtype_info->{kid},
+                                            pack( 'H*', $sess_secrets->{salt}->{search_kid} ),
+                                                    $sess_secrets->{pdkargs}->{iters},
+                                                    $sess_secrets->{pdkargs}->{hash},
+                                                    $sess_secrets->{pdkargs}->{dklen} );
+
+                                    #my $dtype_hkid_hex =  unpack("H*",$dtype_hkid);  # output dtype_hkid as hexadecimal
+                                    $hkid_hex_hash{ $dtype_hkid }{'searchId'}  = $sess_secrets->{skeys}->{search_id};
+                                    $hkid_hex_hash{ $dtype_hkid }{'secrets'}   = $sess_secrets;
+                                    #$hkid_hex_hash{ $dtype_hkid }{'hkid_hex'}  = $dtype_hkid_hex;
+
+                                    $dtype_info->{hkid} = $dtype_hkid;
+                                    $keyring_hkid_mapping->{$dtype_hkid} = $sess_secrets->{kid};
+
+                                    ######################print "HASHED KID from INFO ";
+                                    ######################print "HASHED KID from INFO " . Dumper($dtype_hkid);
+                                    ######################print "HASHED KID HEX from INFO " . Dumper($dtype_hkid_hex);
+                                }
+                                $keyring_krid_mapping{$krid} =$sess_secrets->{kid};
+                                $keyring_metadata{$sess_secrets->{kid}} = $sess_secrets;
+                            ######################print "keyring_metadata " . Dumper($keyring_metadata);
+
+                            #my $ts_range_type = "selves";
+
+                                push @$keyring_keys, {
+                                        v             => 8,
+                                        krid          => $krid,                                                # krid of keyring record `keyring.krid`
+                                        kid           => $sess_secrets->{kid},                                 # all-sessionid, id for skeys/salts/pdkargs
+                                        kids          => [map { $_->{kid} } @{ $skeyring->{info} }],           # datatype-sessionid, ids for all data_types in `info`
+                                        hkid          => $hkid,                                                # hashed kid, same as kid of searchables - `search.kid`
+                                        hkids         => [map { $_->{hkid} } @{ $skeyring->{info} }],          # hashed kid(s), hkid for all data_types in `info`
+                                        data_type     => 'all', ## $sess_secrets->{data_type},
+                                        data_types    => [map { $_->{data_type} } @{ $skeyring->{info} }],
+                                        salt          => $sess_secrets->{salt},
+                                        pdkargs       => $sess_secrets->{pdkargs},
+                                        skeys         => $sess_secrets->{skeys},
+                                        mk_uuid       => $sess_secrets->{mk_uuid},
+                                        timerange     => $sess_secrets->{logts_range},                         # { start => ..., end => ... } ## can be deprecated, doesn't appear to be used
+                                        timeranges    => [map { $_->{logts_range} } @{ $skeyring->{info} }],
+                                        ts_range_type => $ts_range_type,
+                                        needle_type   => 'keyring', # 'all' ## really should be (cust|serv|log)
+                                };
+
+                        } else {
+                                print("Keyring key/metadata unsupported version");
+                                die;
+                        }
+                #print "keyring_keys " . Dumper(@$keyring_keys);
+                } ## end foreach my $keyring (@$rtkeyrings)
+                $sth->finish;
+        };
+        $keyrings{$ts_range_type} = $keyring_keys;
+        #print "keyring_hkid_mapping DUMPER " . Dumper($keyring_hkid_mapping);
+        #}
+
+        #print "keyrings data-structure with ts_range_type: " . Dumper(\%keyrings);
+        my $keyringsref = \%keyrings;
+        write_dumper_to_file( "keyrings.txt", $keyringsref);
+
+        return ( \%keyrings, \%hkid_hex_hash, \%keyring_krid_mapping, \%keyring_metadata );
 
 }
 
